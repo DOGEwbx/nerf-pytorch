@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
+import pdb
 
 import matplotlib.pyplot as plt
 
@@ -17,12 +18,59 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
+from load_ijrr import load_ijrr_data
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-np.random.seed(0)
-DEBUG = False
+# device = torch.device("cpu")
+def seed_torch(seed=1029):
+	random.seed(seed)
+	os.environ['PYTHONHASHSEED'] = str(seed) # 为了禁止hash随机化，使得实验可复现
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	torch.cuda.manual_seed(seed)
+	torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
+	torch.backends.cudnn.benchmark = False
+	torch.backends.cudnn.deterministic = True
 
+seed_torch()
+def print_params(net):
+    for name, parms in net.named_parameters():	
+                    print('-->name:', name)
+                    print('-->para:', parms)
+                    print('-->grad_requirs:',parms.requires_grad)
+                    print('-->grad_value:',parms.grad)
+                    print("===")
+
+
+grads = {}
+ 
+def save_grad(name):
+    def hook(grad):
+        if name not in list(grads.keys()):
+            grads[name] = [grad]
+        else:
+            grads[name].append(grad)
+    return hook
+def eventloss(rgb,rgb_next,img, thresh):
+    """
+    rgb: (B,1)
+    rgb_next: (B,1)
+    img: (B,2)
+    """
+    img = img[Ellipsis,:2]
+    assert img.shape[-1] == 2, f"img shape {img.shape}"
+    loss = torch.log(rgb_next)-torch.log(rgb)
+    # rgb.register_hook(save_grad('loss2')) 
+    # .register_hook(save_grad('rgb'))  
+    loss_origin = torch.sum(torch.abs(loss))
+    # loss.register_hook(save_grad('loss1')) 
+    loss = torch.sum(img*thresh,-1,keepdim=True)-loss
+    loss = (loss.clip(thresh[0],None) - thresh[0]) + (loss.clip(None,thresh[1]) - thresh[1])
+    # pdb.set_trace() 
+    # loss = torch.sum(img*thresh,-1,keepdim=True)-loss
+    loss = torch.sum((loss)**2)
+    return loss, loss_origin
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -39,7 +87,8 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
-
+    # if(torch.isnan (embedded).any()):
+    #         pdb.set_trace()
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
@@ -48,6 +97,8 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
 
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    # if(torch.isnan (outputs).any()):
+    #         pdb.set_trace()
     return outputs
 
 
@@ -122,6 +173,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
+    # pdb.set_trace()
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
@@ -146,7 +198,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 
     rgbs = []
     disps = []
-
+    # pdb.set_trace()
     t = time.time()
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
@@ -166,6 +218,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
+            np.save(os.path.join(savedir, '{:03d}.npy'.format(i)), rgbs[-1])
             imageio.imwrite(filename, rgb8)
 
 
@@ -184,7 +237,7 @@ def create_nerf(args):
     embeddirs_fn = None
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
-    output_ch = 5 if args.N_importance > 0 else 4
+    output_ch = 5 - 2 if args.N_importance > 0 else 4 - 2 # from 3 channel RGB to 1 channel gray
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
@@ -197,7 +250,8 @@ def create_nerf(args):
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
-
+    thresh = nn.Parameter(torch.Tensor([0.5,-0.5]))
+    # grad_vars += [thresh]
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
@@ -256,7 +310,7 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, thresh
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -275,32 +329,34 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
 
     dists = z_vals[...,1:] - z_vals[...,:-1]
+    # pdb.set_trace()
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
-    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+    rgb = torch.sigmoid(raw[...,:1])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+        noise = torch.randn(raw[...,1].shape) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
+            noise = np.random.rand(*list(raw[...,1].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[...,1] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
-
+    # if torch.isnan(rgb_map).any():
+    #     pdb.set_trace()
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
 
-    if white_bkgd:
-        rgb_map = rgb_map + (1.-acc_map[...,None])
+    # if white_bkgd:
+        # rgb_map = rgb_map + (1.-acc_map[...,None])
 
     return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -382,12 +438,16 @@ def render_rays(ray_batch,
 
 
 #     raw = run_network(pts)
+    # pdb.set_trace()
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
+    # pdb.set_trace()
+    # if(torch.isnan (rgb_map).any()):
+    #         pdb.set_trace()
     if N_importance > 0:
 
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        # pdb.set_trace()
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -412,8 +472,9 @@ def render_rays(ray_batch,
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
+        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()):
             print(f"! [Numerical Error] {k} contains nan or inf.")
+            pdb.set_trace()
 
     return ret
 
@@ -446,9 +507,9 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*32, 
+    parser.add_argument("--chunk", type=int, default=1024*8, 
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64, 
+    parser.add_argument("--netchunk", type=int, default=1024*16, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
@@ -472,7 +533,7 @@ def config_parser():
                         help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--multires_views", type=int, default=4, 
                         help='log2 of max freq for positional encoding (2D direction)')
-    parser.add_argument("--raw_noise_std", type=float, default=0., 
+    parser.add_argument("--raw_noise_std", type=float, default=1, 
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
 
     parser.add_argument("--render_only", action='store_true', 
@@ -523,7 +584,7 @@ def config_parser():
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_testset", type=int, default=50000, 
+    parser.add_argument("--i_testset", type=int, default=1000, 
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
@@ -537,7 +598,9 @@ def train():
     args = parser.parse_args()
 
     # Load data
-    K = None
+    K = np.array([[199.092366542, 0, 132.192071378],
+                    [0,198.82882047, 110.712660011],
+                    [0,0,1.0]])
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
@@ -603,6 +666,16 @@ def train():
         near = hemi_R-1.
         far = hemi_R+1.
 
+    elif args.dataset_type == 'ijrr':
+        images, poses, render_poses, hwf, i_split = load_ijrr_data(args.datadir, args.half_res, args.testskip)
+        print('Loaded ijrr', images.shape, render_poses.shape, hwf, args.datadir)
+        i_train, i_val, i_test = i_split
+
+        near = 0.1
+        far = 2.8
+
+        if args.white_bkgd:
+            assert False, 'white bkgd not supported for ijrr'
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -637,7 +710,7 @@ def train():
             file.write(open(args.config, 'r').read())
 
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, threshB = create_nerf(args)
     global_step = start
 
     bds_dict = {
@@ -678,11 +751,14 @@ def train():
         # For random ray batching
         print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        rays_next = rays[1:,...]
+        rays = rays[:-1,...]
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+        rays_rgb = np.concatenate([rays, rays_next, images[:-1,None]], 1) # [N, (ro+rd) + (ro+rd)next + rgb, H, W, 3]
+        assert rays_rgb.shape == (rays.shape[0],5,H,W,3)
+        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, (ro+rd) + (ro+rd)next + rgb, 3]
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train[:-1]], 0) # train images only
+        rays_rgb = np.reshape(rays_rgb, [-1,5,3]) # [(N-1)*H*W,(ro+rd) + (ro+rd)next + rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
         np.random.shuffle(rays_rgb)
@@ -714,9 +790,9 @@ def train():
         # Sample random ray batch
         if use_batching:
             # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+2+1, 3*?]
             batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+            batch_rays, batch_rays_next, target_s = batch[:2], batch[2:4], batch[4]
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
@@ -727,6 +803,7 @@ def train():
 
         else:
             # Random from one image
+            assert False, 'Not implemented'
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
@@ -760,18 +837,31 @@ def train():
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
-
+        rgb.register_hook(save_grad('rgb'))
+        # extras["rgb0"].register_hook(save_grad('rgb0'))                                      
+        # if(torch.isnan (rgb).any()):
+        #     pdb.set_trace()
+        rgb_next, disp_next, acc_next, extras_next = render(H, W, K, chunk=args.chunk, rays=batch_rays_next,
+                                                verbose=i < 10, retraw=True,
+                                                **render_kwargs_train)
         optimizer.zero_grad()
-        img_loss = img2mse(rgb, target_s)
+        img_loss, loss_origin= eventloss(rgb, rgb_next, target_s, threshB)
+        img_loss.register_hook(save_grad('img_loss'))
+
+        threshBloss = threshloss(threshB)
+        threshBloss.register_hook(save_grad('threshBloss')) 
         trans = extras['raw'][...,-1]
-        loss = img_loss
-        psnr = mse2psnr(img_loss)
-
+        loss = img_loss +  100*threshBloss
+        # if i %10 == 0:
+        #     pdb.set_trace(  )
+        psnr = 0 #mse2psnr(img_loss)
+        img_loss0 = 0
+        img_loss_origin0 = 0
         if 'rgb0' in extras:
-            img_loss0 = img2mse(extras['rgb0'], target_s)
+            img_loss0, img_loss_origin0= eventloss(extras['rgb0'], extras_next['rgb0'],target_s, threshB)
             loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
-
+            psnr0 = 0 # mse2psnr(img_loss0)
+        # pdb.set_trace()
         loss.backward()
         optimizer.step()
 
@@ -783,7 +873,7 @@ def train():
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
         ################################
-
+        # pdb.set_trace()
         dt = time.time()-time0
         # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
@@ -799,14 +889,14 @@ def train():
             }, path)
             print('Saved checkpoints at', path)
 
-        if i%args.i_video==0 and i > 0:
-            # Turn on testing mode
-            with torch.no_grad():
-                rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
-            print('Done, saving', rgbs.shape, disps.shape)
-            moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+        # if i%args.i_video==0 and i > 0:
+        #     # Turn on testing mode
+        #     with torch.no_grad():
+        #         rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
+        #     print('Done, saving', rgbs.shape, disps.shape)
+        #     moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
+        #     imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+        #     imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
             # if args.use_viewdirs:
             #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
@@ -819,6 +909,7 @@ def train():
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
             os.makedirs(testsavedir, exist_ok=True)
             print('test poses shape', poses[i_test].shape)
+            # pdb.set_trace()
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, K, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
@@ -826,7 +917,8 @@ def train():
 
     
         if i%args.i_print==0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            # pdb.set_trace()
+            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}, img loss {img_loss.item() } origin {loss_origin.item()}, img loss 0 {img_loss0.item()} {img_loss_origin0.item()}, thresh loss {threshBloss.item()} thresh {threshB[0].item()} {threshB[1].item()}")
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))

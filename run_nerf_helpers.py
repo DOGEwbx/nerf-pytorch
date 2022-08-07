@@ -3,10 +3,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
+import pdb
 
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
+# def eventloss(rgb,rgb_next,img, thresh):
+#     """
+#     rgb: (B,1)
+#     rgb_next: (B,1)
+#     img: (B,2)
+#     """
+#     img = img[Ellipsis,:2]
+#     assert img.shape[-1] == 2, f"img shape {img.shape}"
+#     loss = torch.log(rgb_next)-torch.log(rgb)
+#     loss_origin = torch.sum(loss)
+#     loss = (loss.clip(thresh[0],None) - thresh[0]) + (loss.clip(None,thresh[1]) - thresh[1])
+#     loss = torch.sum(img*thresh,-1,keepdim=True)-loss
+#     loss = torch.sum((loss)**2)
+#     return loss, loss_origin
+# threshloss = lambda x: torch.sum(torch.where(-torch.abs(x)+0.3>0 ,1.,0.))
+# threshloss = lambda x: torch.sum(torch.clip(-torch.abs(x)+0.3,0.,0.3))*40
+# threshloss = lambda x: torch.sum(torch.abs(x-torch.tensor([0.3,-0.3], device=x.device)))
+threshloss = lambda x: torch.sum(torch.sigmoid(1e7*(0.5-torch.abs(x))))
+# threshloss = lambda x: ((1 if x[0]<0.5 else 0)+(x[1]/x[1] if x[1]>-0.5 else x[1]-x[1]))
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
@@ -89,34 +108,47 @@ class NeRF(nn.Module):
         if use_viewdirs:
             self.feature_linear = nn.Linear(W, W)
             self.alpha_linear = nn.Linear(W, 1)
-            self.rgb_linear = nn.Linear(W//2, 3)
+            # self.rgb_linear = nn.Linear(W//2, 3)
+            self.rgb_linear = nn.Linear(W//2, 1) # gray
         else:
             self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        # if(torch.isnan (input_pts).any()):
+        #     pdb.set_trace()
+        # if(torch.isnan (input_views).any()):
+        #     pdb.set_trace()
         h = input_pts
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
             h = F.relu(h)
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
-
+        # if(torch.isnan (h).any()):
+        #     pdb.set_trace()
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
+            # if(torch.isnan (alpha).any()):
+            #     pdb.set_trace()
             feature = self.feature_linear(h)
+            # if(torch.isnan (feature).any()):
+            #     pdb.set_trace()
             h = torch.cat([feature, input_views], -1)
         
             for i, l in enumerate(self.views_linears):
                 h = self.views_linears[i](h)
                 h = F.relu(h)
+                # if(torch.isnan (h).any()):
+                #     pdb.set_trace()
 
             rgb = self.rgb_linear(h)
             outputs = torch.cat([rgb, alpha], -1)
         else:
             outputs = self.output_linear(h)
-
-        return outputs    
+        # if(torch.isnan (outputs).any()):
+        #     pdb.set_trace()
+        return outputs   
 
     def load_weights_from_keras(self, weights):
         assert self.use_viewdirs, "Not implemented if use_viewdirs=False"
